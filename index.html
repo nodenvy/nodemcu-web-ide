@@ -119,6 +119,7 @@
 <script>
     function clearDebug(){
         document.getElementById('debug').textContent = ''
+        if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
     }
 </script>
 
@@ -186,6 +187,7 @@
     function getFile(fileName){
         console.log('GET FILE', fileName)
         document.getElementById('debug').textContent += 'load '+fileName+'\n'
+        if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
         var code = `
         print('[T!T]--init--')
         print('[T!T]{"op":"file", "name":"${fileName}"}')
