@@ -22,10 +22,10 @@
         decoder = new TextDecoderStream()
         reader = null
         writer = null
-        connected = true
-        document.getElementById('connect').innerHTML = 'disconnect'
         port = await navigator.serial.requestPort()
         await port.open({ baudRate: 115200 })
+        connected = true
+        document.getElementById('connect').innerHTML = 'disconnect'
         port.readable.pipeTo(decoder.writable)
         reader = decoder.readable.pipeThrough(new TransformStream(new LineBreakTransformer())).getReader()
         writer = port.writable.getWriter()
