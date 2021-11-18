@@ -4,7 +4,9 @@
     var parsedData = ''
     var parsedMetadata = ''
     var filesToLoad = []
-    var files = [{name:'terminal', content:'print(node.heap())'}]
+    var files = [{name:'code', content:'print(node.heap())'}]
+    var commands = JSON.parse( localStorage.getItem("commands") ) || ['']
+    var commandIndex = 0
     var currentFile = 0
     var connected = false
     var autoScroll = true
@@ -43,8 +45,8 @@
             if(isParse){
                 parseResponse(value)
             }else{
-                document.getElementById('debug').innerHTML += value+'\n'
-                if(autoScroll) document.getElementById('debug').scrollTo(0,document.getElementById('debug').scrollHeight)
+                document.getElementById('debug').textContent += value+'\n'
+                if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
             }
         }
     }
@@ -57,7 +59,7 @@
                 const data = lines[i]+'\n'
                 const dataArrayBuffer = encoder.encode(data);
                 return await writer.write(dataArrayBuffer);
-            }, i * 100)
+            }, i * 50)
         }
         //writer.releaseLock()
     }
@@ -73,7 +75,7 @@
             setTimeout(async () => {
                 const data = chunks[i]
                 return await writer.write(data);
-            }, i * 100)
+            }, i * 50)
         }
     }
 
@@ -116,7 +118,7 @@
 
 <script>
     function clearDebug(){
-        document.getElementById('debug').innerHTML = ''
+        document.getElementById('debug').textContent = ''
     }
 </script>
 
@@ -183,6 +185,7 @@
     }
     function getFile(fileName){
         console.log('GET FILE', fileName)
+        document.getElementById('debug').textContent += 'load '+fileName+'\n'
         var code = `
         print('[T!T]--init--')
         print('[T!T]{"op":"file", "name":"${fileName}"}')
@@ -215,7 +218,7 @@
         document.getElementById('files').innerHTML = ''
         for(var i=0 ; i<files.length ; i++){
             var file = files[i]
-            document.getElementById('files').innerHTML += `<div id="${file.name}" class="file" data-index="${i}" onclick="selectFile(this.getAttribute('data-index'))">${file.name}</div>`
+            document.getElementById('files').innerHTML += `<div class="file" data-index="${i}" onclick="selectFile(this.getAttribute('data-index'))">${file.name}</div>`
         }
         selectFile(currentFile)
     }
@@ -229,14 +232,51 @@
         send(code)
     }
     function saveCurrentFile(){
+        if(currentFile == 0) return
+        saveFileName(currentFile)
         saveFile(files[currentFile].name, files[currentFile].content)
     }
     function newFile(){
         files.push({name:'new', content:''})
         refreshFilesBar()
+        selectFile(files.length-1)
+        editFileName(files.length-1)
+    }
+    function editFileName(index){
+        document.querySelectorAll('[data-index="'+index+'"]')[0].setAttribute('contenteditable', true)
+        document.querySelectorAll('[data-index="'+index+'"]')[0].focus()
+    }
+    function saveFileName(index){
+        files[index].name = document.querySelectorAll('[data-index="'+index+'"]')[0].innerHTML
+        refreshFilesBar()
     }
     function deleteCurrentFile(){
-
+        if(currentFile == 0) return
+        if(window.confirm('sure?')){
+            send('file.remove("'+files[currentFile].name+'")')
+            files.splice(currentFile, 1)
+            selectFile(0)
+            refreshFilesBar()
+        }
+    }
+    function sendCommand(event) {
+        if(event.keyCode == 13) {
+            var data = document.getElementById('command').value
+            if(commands[1] != data && data != '') commands.splice(1, 0, data)
+            localStorage.setItem("commands", JSON.stringify(commands))
+            commandIndex = 0
+            command[0] = ''
+            send(data)
+            document.getElementById('command').value = ''
+        }else if(event.keyCode == 38){
+            event.preventDefault();
+            if(commandIndex==0) commands[0] = document.getElementById('command').value
+            if(commands[commandIndex+1]) document.getElementById('command').value = commands[++commandIndex]
+        }else if(event.keyCode == 40){
+            event.preventDefault();
+            if(commandIndex > 0) document.getElementById('command').value = commands[--commandIndex]
+            else document.getElementById('command').value = commands[0]
+        }
     }
 </script>
 
@@ -252,18 +292,17 @@
         <div class="button" id="new" onclick="newFile()">new</div>
         <div class="button" id="clear" onclick="clearDebug()">clear</div>
     </div>
-<div id="files"><div id="terminal" data-index="0" class="file selected" onclick="selectFile(this.getAttribute('data-index'))">terminal</div></div>
+<div id="files"><div data-index="0" class="file selected" onclick="selectFile(this.getAttribute('data-index')); e.preventDefault()">code</div></div>
 <textarea id="code" onchange="updateFile()" autofocus>
-print(node.heap())
-print('1')
-print(node.heap())
-print('2')
-print(node.heap())
-print('3')
 print(node.heap())
 </textarea>
 
-<pre id="debug"></pre>
+<div id="console" onclick="document.getElementById('command').focus()">
+    <pre id="debug" onclick="event.stopPropagation()"></pre>
+    <div id="commandContainer">
+        <div id="commandTag">>&nbsp;</div><input id="command" type="text" onkeydown="sendCommand(event)"></input>
+    </div>
+</div>
 
 </div>
 
@@ -272,6 +311,7 @@ print(node.heap())
         padding:0;
         margin:0;
         box-sizing:border-box;
+        
     }
     #app{
         display: flex;
@@ -291,15 +331,40 @@ print(node.heap())
         outline: none;
         white-space: nowrap;
     }
-    #debug{
+    #console{
         float:right;
         height: calc(100% - 80px);
         flex: 1 0 50%;
         overflow: scroll;
-        overflow: scroll;
         color:white;
+        font-family: monospace;
         background:rgb(50,50,50);
         padding:5px;
+    }
+    #debug{
+        color: inherit;
+        font-size: inherit;
+        font-family: inherit;
+    }
+    #commandContainer{
+        display: flex;
+    }
+    #commandTag{
+        font-family: inherit;
+        background: transparent;
+        color: inherit;
+        font-size: inherit;
+        font-family: inherit;
+    }
+    #command{
+        width: 100%;
+        font-family: inherit;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: inherit;
+        font-size: inherit;
+        font-family: inherit;
     }
     #files{
         display: flex;
