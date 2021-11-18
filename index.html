@@ -1,0 +1,351 @@
+<script>
+    var isParse = false
+    var parseState = 0
+    var parsedData = ''
+    var parsedMetadata = ''
+    var filesToLoad = []
+    var files = [{name:'terminal', content:'print(node.heap())'}]
+    var currentFile = 0
+    var connected = false
+    var autoScroll = true
+</script>
+
+<script>
+    // SERIAL //
+    port = null
+    function connect(){
+        if(connected) closePort()
+        else openPort()
+    }
+    async function openPort(){
+        encoder = new TextEncoder()
+        decoder = new TextDecoderStream()
+        reader = null
+        writer = null
+        connected = true
+        document.getElementById('connect').innerHTML = 'disconnect'
+        port = await navigator.serial.requestPort()
+        await port.open({ baudRate: 115200 })
+        port.readable.pipeTo(decoder.writable)
+        reader = decoder.readable.pipeThrough(new TransformStream(new LineBreakTransformer())).getReader()
+        writer = port.writable.getWriter()
+
+        read()
+    }
+
+    async function read(){
+        while(true){
+            const { value, done } = await reader.read()
+            if (done) {
+                reader.releaseLock();
+                break;
+            }
+            if(isParse){
+                parseResponse(value)
+            }else{
+                document.getElementById('debug').innerHTML += value+'\n'
+                if(autoScroll) document.getElementById('debug').scrollTo(0,document.getElementById('debug').scrollHeight)
+            }
+        }
+    }
+
+    async function send(code){
+        var lines = code.split('\n');
+
+        for(let i = 0;i < lines.length;i++){
+            setTimeout(async () => {
+                const data = lines[i]+'\n'
+                const dataArrayBuffer = encoder.encode(data);
+                return await writer.write(dataArrayBuffer);
+            }, i * 100)
+        }
+        //writer.releaseLock()
+    }
+    async function sendBlock(data){
+        const dataArrayBuffer = encoder.encode(data);
+
+        var chunks = [], i = 0, n = dataArrayBuffer.length;
+        while (i < n) {
+            chunks.push(dataArrayBuffer.slice(i, i += 1024));
+        }
+
+        for(let i = 0;i < chunks.length;i++){
+            setTimeout(async () => {
+                const data = chunks[i]
+                return await writer.write(data);
+            }, i * 100)
+        }
+    }
+
+    //Agruppa el texto que va entrando en líneas
+    class LineBreakTransformer {
+        constructor() {
+            this.chunks = "";
+        }
+        transform(chunk, controller) {
+            this.chunks += chunk
+            const lines = this.chunks.split("\r\n");
+            this.chunks = lines.pop();
+            lines.forEach((line) => controller.enqueue(line));
+        }
+        flush(controller) {
+            controller.enqueue(this.chunks);
+        }
+    }
+
+    navigator.serial.addEventListener("connect", (event) => {
+        console.log('connected port')
+        //connected = true
+        //document.getElementById('connect').innerHTML = 'disconnect'
+    });
+
+    navigator.serial.addEventListener("disconnect", (event) => {
+        console.log('disconnected port')
+        connected = false
+        document.getElementById('connect').innerHTML = 'connect'
+    });
+
+    async function closePort(){
+        await reader.cancel();
+        await writer.close();
+        await port.close();
+        connected = false
+        document.getElementById('connect').innerHTML = 'connect'
+    }
+</script>
+
+<script>
+    function clearDebug(){
+        document.getElementById('debug').innerHTML = ''
+    }
+</script>
+
+<script>
+    //Funciones del editor
+    function disableEcho(){
+        var code = `a, b, c, d = uart.getconfig(0)
+                uart.setup(0, a, b, c, d, 0)`
+        send(code)
+    }
+    function parseResponse(data){
+        if(data.startsWith("[T!T]")){
+            data = data.replace('[T!T]','')
+            //console.log('parse>', data)
+            if(parseState==0){
+                if(data == '--init--') parseState = 1
+            }else if(parseState==1){
+                parsedMetadata = JSON.parse(data)
+                parseState = 2
+            }else if(parseState==2){
+                if(data != '--stop--'){
+                    parsedData += data+'\n'
+                }else{
+                    processResponse()
+                }
+            }
+        }
+    }
+    function processResponse(){
+        if(parsedMetadata.op == 'file'){
+            var found = null
+            for(var i=0 ; i<files.length ; i++){
+                if(files[i].name == parsedMetadata.name) found = i
+            }
+            if(parsedData) parsedData = parsedData.replace(/\n$/,'') //remove last enter
+            if(found) files[found] = {name:parsedMetadata.name, content:parsedData}
+            else files.push({name:parsedMetadata.name, content:parsedData})
+            refreshFilesBar()
+            parseState = 0
+            isParse = false
+            parsedData = ''
+            parsedMetadata = ''
+            if(filesToLoad.length>0) getFile(filesToLoad.shift())
+        }else if(parsedMetadata.op == 'files'){
+            var files2 = JSON.parse(parsedData)
+            for(var file in files2){
+                filesToLoad.push(file)
+            }
+            parseState = 0
+            isParse = false
+            parsedData = ''
+            parsedMetadata = ''
+            if(filesToLoad.length>0) getFile(filesToLoad.shift())
+        }
+    }
+    function getFiles(){
+        var code = `
+        print('[T!T]--init--')
+        print('[T!T]{"op":"files"}')
+        print('[T!T]'..sjson.encode(file.list()))
+        print('[T!T]--stop--')`
+        isParse = true
+        send(code)
+    }
+    function getFile(fileName){
+        console.log('GET FILE', fileName)
+        var code = `
+        print('[T!T]--init--')
+        print('[T!T]{"op":"file", "name":"${fileName}"}')
+        if file.open("${fileName}", "r") then
+            line = file.readline()
+            while line do
+                print('[T!T]'..line)
+                line = file.readline()
+            end
+            file.close()
+        end
+        print('[T!T]--stop--')
+        `
+        isParse = true
+        send(code)
+    }
+    function selectFile(index){
+        document.querySelectorAll('[data-index="'+currentFile+'"]')[0].classList.remove("selected")
+        document.querySelectorAll('[data-index="'+index+'"]')[0].classList.add("selected")
+        currentFile = index
+        document.getElementById('code').value = files[currentFile].content
+    }
+    function updateFile(){
+        files[currentFile].content = document.getElementById('code').value
+    }
+    function loadFiles(name){
+
+    }
+    function refreshFilesBar(){
+        document.getElementById('files').innerHTML = ''
+        for(var i=0 ; i<files.length ; i++){
+            var file = files[i]
+            document.getElementById('files').innerHTML += `<div id="${file.name}" class="file" data-index="${i}" onclick="selectFile(this.getAttribute('data-index'))">${file.name}</div>`
+        }
+        selectFile(currentFile)
+    }
+    function saveFile(fileName, content){
+        var code = `file.open('${fileName}', 'w')\n`
+        var lines = content.split('\n');
+        for(let i = 0;i < lines.length;i++){
+            code += `file.writeline([=[${lines[i]}]=])\n`
+        }
+        code += `file.close()\n`
+        send(code)
+    }
+    function saveCurrentFile(){
+        saveFile(files[currentFile].name, files[currentFile].content)
+    }
+    function newFile(){
+        files.push({name:'new', content:''})
+        refreshFilesBar()
+    }
+    function deleteCurrentFile(){
+
+    }
+</script>
+
+<div id="app">
+    <div id="buttons">
+        <div class="button" id="connect" onclick="connect()">connect</div>
+        <!--<div class="button" id="close" onclick="closePort()">close</div>-->
+        <div class="button" id="restart" onclick="send('node.restart()')">restart</div>
+        <div class="button" id="load" onclick="getFiles()">load</div>
+        <div class="button" id="run" onclick="send(document.getElementById('code').value)">run</div>
+        <div class="button" id="save" onclick="saveCurrentFile()">save</div>
+        <div class="button" id="delete" onclick="deleteCurrentFile()">delete</div>
+        <div class="button" id="new" onclick="newFile()">new</div>
+        <div class="button" id="clear" onclick="clearDebug()">clear</div>
+    </div>
+<div id="files"><div id="terminal" data-index="0" class="file selected" onclick="selectFile(this.getAttribute('data-index'))">terminal</div></div>
+<textarea id="code" onchange="updateFile()" autofocus>
+print(node.heap())
+print('1')
+print(node.heap())
+print('2')
+print(node.heap())
+print('3')
+print(node.heap())
+</textarea>
+
+<pre id="debug"></pre>
+
+</div>
+
+<style>
+    *{
+        padding:0;
+        margin:0;
+        box-sizing:border-box;
+    }
+    #app{
+        display: flex;
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-content: flex-start;
+        height: 100%;
+    }
+    #code{
+        float:left;
+        height: calc(100% - 80px);
+        flex: 1 0 50%;
+        overflow: scroll;
+        padding:5px;
+        resize: none;
+        background-color: darkgrey;
+        outline: none;
+        white-space: nowrap;
+    }
+    #debug{
+        float:right;
+        height: calc(100% - 80px);
+        flex: 1 0 50%;
+        overflow: scroll;
+        overflow: scroll;
+        color:white;
+        background:rgb(50,50,50);
+        padding:5px;
+    }
+    #files{
+        display: flex;
+        background: #4e4e4e;
+        width:100%;
+        height:40px;
+    }
+    .file{
+        padding: 10px 15px;
+        color: #9b9b9b;
+        cursor: pointer;
+        font-size: 14px;
+        background: rgb(255 255 255 / 10%);
+        margin-right: 1px;
+        font-family: arial;
+        height: 35px;
+        margin-top: 5px;
+        line-height: 15px;
+    }
+    .file:hover{
+        color:white;
+    }
+    .file.selected{
+        background: rgb(0 0 0 / 25%);
+        color:white;
+    }
+    #buttons{
+        display: flex;
+        background: #1b1b1b;
+        width:100%;
+        height:40px;
+    }
+    .button{
+        padding: 10px 15px;
+        color: #9b9b9b;
+        cursor: pointer;
+        font-size: 14px;
+        background: rgb(255 255 255 / 10%);
+        margin-right: 1px;
+        font-family: arial;
+        margin: 5px;
+        line-height: 10px;
+        min-width: 80px;
+        text-align: center;
+    }
+    .button:hover{
+        color:white;
+    }
+</style>
