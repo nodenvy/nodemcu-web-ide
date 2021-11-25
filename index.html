@@ -1,242 +1,322 @@
+<!-- COEDMIRROR -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/codemirror.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/theme/material-darker.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/mode/xml/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/mode/javascript/javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/mode/css/css.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/mode/htmlmixed/htmlmixed.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.63.3/mode/lua/lua.min.js"></script>
+<!-- MQTT -->
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
 <script>
-    var isParse = false
-    var parseState = 0
-    var parsedData = ''
-    var parsedMetadata = ''
+    const urlSearchParams = new URLSearchParams(window.location.search);
+    const params = Object.fromEntries(urlSearchParams.entries());
+
     var filesToLoad = []
-    var files = [{name:'code', content:'print(node.heap())'}]
+    var files = JSON.parse( localStorage.getItem("files") ) || [{name:'>', content:'print(node.heap())', inDevice:true, isConsole:true}]
     var commands = JSON.parse( localStorage.getItem("commands") ) || ['']
     var commandIndex = 0
     var currentFile = 0
-    var connected = false
+    var isConnected = false
     var autoScroll = true
+    var autoSave = true
+    var mode = params['mode'] || 'UART' //UART MQTT
+    var autoConnect = false
+    var deviceId = params['id']
+    var isPrintDebug = false
 </script>
 
 <script>
-    // SERIAL //
     port = null
-    function connect(){
-        if(connected) closePort()
-        else openPort()
+    async function connect(){
+        if(mode == 'UART'){
+            port = await navigator.serial.getPorts();
+            if ((port !== null) && (Array.isArray(port)) && (port.length > 0)) {
+                port = port[0];
+            }else port = null
+
+            if(isConnected) closePort()
+            else openPort(null)
+        }else{
+            if(isConnected) MQTTdisconnect()
+            else MQTTconnect()
+        }
     }
-    async function openPort(){
+    // SERIAL //
+    async function openPort(port){
         encoder = new TextEncoder()
         decoder = new TextDecoderStream()
         reader = null
         writer = null
-        port = await navigator.serial.requestPort()
+        if(!port) port = await navigator.serial.requestPort()
         await port.open({ baudRate: 115200 })
-        connected = true
-        document.getElementById('connect').innerHTML = 'disconnect'
-        port.readable.pipeTo(decoder.writable)
-        reader = decoder.readable.pipeThrough(new TransformStream(new LineBreakTransformer())).getReader()
+        console.log('-- uart connected --')
+        connected()
+
+        reader = port.readable.getReader()
         writer = port.writable.getWriter()
 
         read()
+        getChipId()
+    }
+    // MQTT //
+    function MQTTconnect(){
+        client = mqtt.connect('ws://broker.hivemq.com/mqtt', {port:8000})
+        pref = 'nodenvy/'+deviceId
+        client.on('connect', function(){
+            console.log('-- mqtt connected --')
+            connected()
+            client.subscribe(pref+'/read')
+        })
+        read()
+        getChipId()
     }
 
     async function read(){
-        while(true){
-            const { value, done } = await reader.read()
-            if (done) {
-                reader.releaseLock();
-                break;
+        if(mode == 'UART'){
+            while(true){
+                const { value, done } = await reader.read()
+                if (done) {
+                    reader.releaseLock();
+                    break;
+                }
+                //console.log(data)
+                onDeviceMessage(value)
             }
-            if(isParse){
-                parseResponse(value)
-            }else{
-                document.getElementById('debug').textContent += value+'\n'
-                if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
+        }else{
+            client.on("message", function(topic, value){
+                //console.log(data)
+                onDeviceMessage(value)
+            })
+        }
+    }
+
+    var deviceMessage = ''
+    function onDeviceMessage(msg){
+        //console.log('msg', msg)
+        var charMsg = String.fromCharCode(...msg)
+        deviceMessage += charMsg
+        if(typeof toResolveReady != 'undefined' && deviceMessage.endsWith("> ")) toResolveReady(null)
+        printDebug(charMsg)
+
+        var lines = deviceMessage.split('\n');
+        if(lines.length > 1){
+            deviceMessage = lines.pop()
+            for(let i = 0;i < lines.length;i++){
+                onDeviceMessageReady(lines[i]+'\n')
             }
         }
     }
 
-    async function send(code){
-        var lines = code.split('\n');
-
-        for(let i = 0;i < lines.length;i++){
-            setTimeout(async () => {
-                const data = lines[i]+'\n'
-                const dataArrayBuffer = encoder.encode(data);
-                return await writer.write(dataArrayBuffer);
-            }, i * 50)
+    var toLoadFile = {name:'', content:''}
+    function onDeviceMessageReady(msg){
+        //console.log('<', msg)
+        if(msg.startsWith("[[[[ CHIPID ]]]]")){
+            var chipId = JSON.parse(msg.split('[[[[ CHIPID ]]]]')[1])
+            setChipId(chipId)
+        }else if(msg.startsWith("[[[[ FILES ]]]]")){
+            filesJSON = JSON.parse(msg.split('[[[[ FILES ]]]]')[1])
+            for(var k in filesJSON) filesToLoad.push(k)
+            loadFiles()
+        }else if(msg.startsWith("[[[[ FILE ]]]]")){
+            toLoadFile.name = JSON.parse(msg.split('[[[[ FILE ]]]]')[1]).name
+        }else if (msg.startsWith("[[[[ STOP ]]]]")){
+            toLoadFile.content = toLoadFile.content.replace(/(\n)(\r\n)$/, "") //remove last 2 enter
+            loadFile(toLoadFile)
+            toLoadFile = {name:'', content:''}
+            loadFiles()
+        }else if (toLoadFile.name){
+            toLoadFile.content += msg
         }
+    }
+
+    async function send(code, callback){
+        var isChunkos = false
+        //console.log('SEND CODE', code)
+        if(!isChunkos) var lines = code.split('\n');
+        else var lines = code.match(/(.|[\r\n]){1,1000}/g)
+        for(let i = 0;i < lines.length;i++){
+            var data = lines[i]
+            //if(data == '') continue
+            if(!isChunkos) data += '\n'
+            console.log('>', data)
+            if(mode == 'UART'){
+                const dataArrayBuffer = encoder.encode(data);
+                writer.write(dataArrayBuffer);
+            }else{
+                client.publish(pref+'/write', data, {qos:0})
+            }
+            prom = await waitTerminalReady()            
+        }
+        if(callback) callback()
         //writer.releaseLock()
     }
-    async function sendBlock(data){
-        const dataArrayBuffer = encoder.encode(data);
 
-        var chunks = [], i = 0, n = dataArrayBuffer.length;
-        while (i < n) {
-            chunks.push(dataArrayBuffer.slice(i, i += 1024));
-        }
-
-        for(let i = 0;i < chunks.length;i++){
-            setTimeout(async () => {
-                const data = chunks[i]
-                return await writer.write(data);
-            }, i * 50)
-        }
-    }
-
-    //Agruppa el texto que va entrando en líneas
-    class LineBreakTransformer {
-        constructor() {
-            this.chunks = "";
-        }
-        transform(chunk, controller) {
-            this.chunks += chunk
-            const lines = this.chunks.split("\r\n");
-            this.chunks = lines.pop();
-            lines.forEach((line) => controller.enqueue(line));
-        }
-        flush(controller) {
-            controller.enqueue(this.chunks);
-        }
+    let prom
+    function waitTerminalReady(){
+        if(prom) return prom
+        prom = new Promise(resolve => {
+            toResolveReady = resolve
+        })
+        return prom
     }
 
     navigator.serial.addEventListener("connect", (event) => {
-        console.log('connected port')
-        //connected = true
-        //document.getElementById('connect').innerHTML = 'disconnect'
+        console.log('connected port', event)
+        //openPort(event.target)
+        connected()
     });
 
     navigator.serial.addEventListener("disconnect", (event) => {
-        console.log('disconnected port')
-        connected = false
-        document.getElementById('connect').innerHTML = 'connect'
+        console.log('disconnected port', event)
+        disconnected()
     });
 
     async function closePort(){
         await reader.cancel();
         await writer.close();
         await port.close();
-        connected = false
-        document.getElementById('connect').innerHTML = 'connect'
+        disconnected()
     }
-</script>
 
-<script>
-    function clearDebug(){
-        document.getElementById('debug').textContent = ''
-        if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
+    function MQTTdisconnect(){
+        client.end()
+        disconnected()
     }
+    //connect()
 </script>
 
 <script>
     //Funciones del editor
     function disableEcho(){
         var code = `a, b, c, d = uart.getconfig(0)
-                uart.setup(0, a, b, c, d, 0)`
+                uart.setup(0, a, b, c, d, 0)\r`
         send(code)
     }
-    function parseResponse(data){
-        if(data.startsWith("[T!T]")){
-            data = data.replace('[T!T]','')
-            //console.log('parse>', data)
-            if(parseState==0){
-                if(data == '--init--') parseState = 1
-            }else if(parseState==1){
-                parsedMetadata = JSON.parse(data)
-                parseState = 2
-            }else if(parseState==2){
-                if(data != '--stop--'){
-                    parsedData += data+'\n'
-                }else{
-                    processResponse()
-                }
-            }
-        }
+    function enableEcho(){
+        var code = `a, b, c, d = uart.getconfig(0)
+                uart.setup(0, a, b, c, d, 1)\r`
+        send(code)
     }
-    function processResponse(){
-        if(parsedMetadata.op == 'file'){
-            var found = null
-            for(var i=0 ; i<files.length ; i++){
-                if(files[i].name == parsedMetadata.name) found = i
-            }
-            if(parsedData) parsedData = parsedData.replace(/\n$/,'') //remove last enter
-            if(found) files[found] = {name:parsedMetadata.name, content:parsedData}
-            else files.push({name:parsedMetadata.name, content:parsedData})
-            refreshFilesBar()
-            parseState = 0
-            isParse = false
-            parsedData = ''
-            parsedMetadata = ''
-            if(filesToLoad.length>0) getFile(filesToLoad.shift())
-        }else if(parsedMetadata.op == 'files'){
-            var files2 = JSON.parse(parsedData)
-            for(var file in files2){
-                filesToLoad.push(file)
-            }
-            parseState = 0
-            isParse = false
-            parsedData = ''
-            parsedMetadata = ''
-            if(filesToLoad.length>0) getFile(filesToLoad.shift())
+    function printDebug(msg){
+        if(!isPrintDebug) return
+        document.getElementById('debug').textContent += msg
+        if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
+    }
+    function loadFiles(){
+        if(filesToLoad[0]) getFile(filesToLoad.shift())
+    }
+    function getChipId(){
+        console.log('GET CHIP ID')
+        isPrintDebug = false
+        for(var file of files) file.inDevice = false
+        if(mode=='UART') var code =  `uart.write(0, '\\r\\n[[[[ CHIPID ]]]]'..node.chipid()..'\\r\\n')\r`
+        if(mode=='MQTT') var code =  `_m:publish(_pref.."/read", '\\r\\n[[[[ CHIPID ]]]]'..node.chipid()..'\\r\\n', 0, 0)\r`
+        send(code, () => { isPrintDebug = true })
+    }
+    function setChipId(chipId){
+        document.getElementById('chipId').innerHTML = chipId
+    }
+    function loadFile(loadFile){
+        var found = null
+        for(var i=0 ; i<files.length ; i++){
+            if(files[i].name == loadFile.name) found = i
         }
+        if(found) files[found] = {...files[found], ...{name:loadFile.name, content:loadFile.content, inDevice:true}}
+        else files.push({name:loadFile.name, content:loadFile.content, inDevice:true})
+        refreshFilesBar()
     }
     function getFiles(){
-        var code = `
-        print('[T!T]--init--')
-        print('[T!T]{"op":"files"}')
-        print('[T!T]'..sjson.encode(file.list()))
-        print('[T!T]--stop--')`
-        isParse = true
+        console.log('GET FILES')
+        for(var file of files) file.inDevice = false
+        if(mode=='UART') var code =  `uart.write(0, '\\r\\n[[[[ FILES ]]]]'..sjson.encode(file.list())..'\\r\\n')\r`
+        if(mode=='MQTT') var code =  `_m:publish(_pref.."/read", '\\r\\n[[[[ FILES ]]]]'..sjson.encode(file.list())..'\\r\\n', 0, 0)\r`
         send(code)
     }
-    function getFile(fileName){
+    function getCurrentFile(){
+        if(currentFile==0) return
+        getFile(files[currentFile].name)
+    }
+    async function getFile(fileName){
         console.log('GET FILE', fileName)
         document.getElementById('debug').textContent += 'load '+fileName+'\n'
         if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
-        var code = `
-        print('[T!T]--init--')
-        print('[T!T]{"op":"file", "name":"${fileName}"}')
-        if file.open("${fileName}", "r") then
-            line = file.readline()
-            while line do
-                print('[T!T]'..line)
-                line = file.readline()
-            end
-            file.close()
-        end
-        print('[T!T]--stop--')
-        `
-        isParse = true
-        send(code)
+        if(mode=='UART') var code = 
+`if file.open("${fileName}", "r") then
+line = file.read(1400)
+uart.write(0, '\\r\\n[[[[ FILE ]]]]{"name":"${fileName}"}\\r\\n')
+while line do
+uart.write(0, line)
+line = file.read(1400)
+end
+uart.write(0, '\\r\\n[[[[ STOP ]]]]\\r\\n')
+file.close()
+end
+`
+        if(mode=='MQTT') var code = 
+`if file.open("${fileName}", "r") then
+line = file.read(1400)
+_m:publish(_pref.."/read", '\\r\\n[[[[ FILE ]]]]{"name":"${fileName}"}\\r\\n', 0, 0)
+while line do
+_m:publish(_pref.."/read", line, 0, 0)
+line = file.read(1400)
+end
+_m:publish(_pref.."/read", '\\r\\n[[[[ STOP ]]]]\\r\\n', 0, 0)
+file.close()
+end
+`
+        await send(code)
     }
     function selectFile(index){
+        files[currentFile].history = editor.getHistory()
+        files[currentFile].cursor = editor.getCursor()
         document.querySelectorAll('[data-index="'+currentFile+'"]')[0].classList.remove("selected")
         document.querySelectorAll('[data-index="'+index+'"]')[0].classList.add("selected")
         currentFile = index
-        document.getElementById('code').value = files[currentFile].content
+        editor.setValue(files[currentFile].content)
+        if(files[currentFile].history) editor.setHistory(files[currentFile].history)
+        else editor.clearHistory()
+        editor.focus()
+        if(files[currentFile].cursor) editor.setCursor(files[currentFile].cursor)
+        else editor.setCursor(0, 0)
     }
     function updateFile(){
-        files[currentFile].content = document.getElementById('code').value
-    }
-    function loadFiles(name){
-
+        files[currentFile].content = editor.getValue()
+        if(autoSave) localStorage.setItem("files", JSON.stringify(files))
     }
     function refreshFilesBar(){
-        document.getElementById('files').innerHTML = ''
+        document.getElementById('files').innerHTML = '<div id="deviceFiles"></div><div id="localFiles"></div>'
         for(var i=0 ; i<files.length ; i++){
             var file = files[i]
-            document.getElementById('files').innerHTML += `<div class="file" data-index="${i}" onclick="selectFile(this.getAttribute('data-index'))">${file.name}</div>`
+            var fileElem = 
+`<div class="file" data-index="${i}" 
+onfocusout="setFileName(this.getAttribute('data-index'))" 
+onkeydown="fileKeyDown(event)" 
+onclick="selectFile(this.getAttribute('data-index'))"
+>${file.name}</div>`
+            if(file.inDevice || file.isConsole) document.getElementById('deviceFiles').innerHTML += fileElem
+            else document.getElementById('localFiles').innerHTML += fileElem
         }
         selectFile(currentFile)
     }
-    function saveFile(fileName, content){
-        var code = `file.open('${fileName}', 'w')\n`
+    async function saveFile(fileName, content){
+        await send(`file.open('${fileName}', 'w')\r`)
+        await new Promise(resolve => setTimeout(resolve, 100));
         var lines = content.split('\n');
+        var code = ''
         for(let i = 0;i < lines.length;i++){
             code += `file.writeline([=[${lines[i]}]=])\n`
         }
-        code += `file.close()\n`
-        send(code)
+        code += `file.close()\r`
+        await send(code)
     }
     function saveCurrentFile(){
         if(currentFile == 0) return
-        saveFileName(currentFile)
         saveFile(files[currentFile].name, files[currentFile].content)
+        files[currentFile].inDevice = true
+        refreshFilesBar()
     }
     function newFile(){
         files.push({name:'new', content:''})
@@ -248,22 +328,34 @@
         document.querySelectorAll('[data-index="'+index+'"]')[0].setAttribute('contenteditable', true)
         document.querySelectorAll('[data-index="'+index+'"]')[0].focus()
     }
-    function saveFileName(index){
+    function fileKeyDown(event) {
+        if(event.keyCode == 13) {
+            setFileName(currentFile)
+        }
+    }
+    function setFileName(index){
+        document.querySelectorAll('[data-index="'+index+'"]')[0].setAttribute('contenteditable', false)
         files[index].name = document.querySelectorAll('[data-index="'+index+'"]')[0].innerHTML
-        refreshFilesBar()
     }
     function deleteCurrentFile(){
         if(currentFile == 0) return
         if(window.confirm('sure?')){
             send('file.remove("'+files[currentFile].name+'")')
+            files[currentFile].inDevice = false
+            refreshFilesBar()
+        }
+    }
+    function closeCurrentFile(){
+        if(currentFile == 0) return
+        if(window.confirm('sure?')){
             files.splice(currentFile, 1)
-            selectFile(0)
+            selectFile(--currentFile)
             refreshFilesBar()
         }
     }
     function sendCommand(event) {
         if(event.keyCode == 13) {
-            var data = document.getElementById('command').value
+            var data = document.getElementById('command').value + '\r'
             if(commands[1] != data && data != '') commands.splice(1, 0, data)
             localStorage.setItem("commands", JSON.stringify(commands))
             commandIndex = 0
@@ -280,29 +372,69 @@
             else document.getElementById('command').value = commands[0]
         }
     }
+    function clearDebug(){
+        document.getElementById('debug').textContent = ''
+        if(autoScroll) document.getElementById('console').scrollTo(0,document.getElementById('console').scrollHeight)
+    }
+    function onConsoleScroll(event){
+        //console.log(event)
+        var element = event.target
+        //console.log(element.scrollHeight - element.scrollTop, element.clientHeight)
+        if((element.scrollHeight - element.scrollTop) - element.clientHeight < 20) {
+            autoScroll = true
+        }else{
+            autoScroll = false
+        }
+    }
+    function connected(){
+        isConnected = true
+        document.getElementById('connect').innerHTML = 'disconnect'
+        document.getElementById('connect').classList.add("connected")
+    }
+    function disconnected(){
+        isConnected = false
+        setChipId('')
+        document.getElementById('connect').innerHTML = 'connect'
+        document.getElementById('connect').classList.remove("connected")
+    }
 </script>
 
 <div id="app">
-    <div id="buttons">
-        <div class="button" id="connect" onclick="connect()">connect</div>
-        <!--<div class="button" id="close" onclick="closePort()">close</div>-->
-        <div class="button" id="restart" onclick="send('node.restart()')">restart</div>
-        <div class="button" id="load" onclick="getFiles()">load</div>
-        <div class="button" id="run" onclick="send(document.getElementById('code').value)">run</div>
-        <div class="button" id="save" onclick="saveCurrentFile()">save</div>
-        <div class="button" id="delete" onclick="deleteCurrentFile()">delete</div>
-        <div class="button" id="new" onclick="newFile()">new</div>
-        <div class="button" id="clear" onclick="clearDebug()">clear</div>
+    <div id="header">
+        <div id="buttons" class="unselectable">
+            <div class="button" id="connect" onclick="connect()">connect</div>
+            <div class="button" id="run" onclick="send( (editor.getSelection() || editor.getValue())+'\r' )">run</div>
+            <div class="button" id="load" onclick="getFiles()">load</div>
+            <div class="button" id="refreseh" onclick="getCurrentFile()">refresh</div>
+            <div class="button" id="new" onclick="newFile()">new</div>
+            <div class="button" id="save" onclick="saveCurrentFile()">save</div>
+            <div class="button" id="delete" onclick="deleteCurrentFile()">delete</div>
+            <div class="button" id="close" onclick="closeCurrentFile()">close</div>
+        </div>
+        <div id="chipId"></div>
     </div>
-<div id="files"><div data-index="0" class="file selected" onclick="selectFile(this.getAttribute('data-index')); e.preventDefault()">code</div></div>
+<div id="files" class="unselectable">
+    <div data-index="0" class="file selected"  onclick="selectFile(this.getAttribute('data-index')); e.preventDefault()">></div>
+</div>
 <textarea id="code" onchange="updateFile()" autofocus>
 print(node.heap())
 </textarea>
 
-<div id="console" onclick="document.getElementById('command').focus()">
-    <pre id="debug" onclick="event.stopPropagation()"></pre>
-    <div id="commandContainer">
-        <div id="commandTag">>&nbsp;</div><input id="command" type="text" onkeydown="sendCommand(event)"></input>
+<div id="consoleContainer">
+    <div id="consoleButtons" class="unselectable">
+        <div class="button cmd" id="clear" onclick="clearDebug()">clear</div>
+        <div class="button cmd" id="restart" onclick="send('node.restart()\r')">restart</div>
+        <div class="button cmd" id="espChipid" onclick="send('print(node.chipid())\r')">chipid</div>
+        <div class="button cmd" id="wifi" onclick="document.getElementById('command').value='wifi.sta.config({ssid=\'\', pwd=\'\'})'">wifi</div>
+        <div class="button cmd" id="wifiIp" onclick="send('print(wifi.sta.getip())\r')">ip</div>
+        <div class="button cmd" id="espFiles" onclick="send('print(sjson.encode(file.list()))\r')">files</div>
+        <div class="button cmd" id="heap" onclick="send('print(node.heap())\r')">heap</div>
+    </div>
+    <div id="console" onclick="document.getElementById('command').focus()" onscroll="onConsoleScroll(event)">
+        <pre id="debug" onclick="event.stopPropagation()"></pre>
+        <div id="commandContainer">
+            <div id="commandTag">>&nbsp;</div><input id="command" type="text" onkeydown="sendCommand(event)"></input>
+        </div>
     </div>
 </div>
 
@@ -315,12 +447,76 @@ print(node.heap())
         box-sizing:border-box;
         
     }
+    *.unselectable {
+        -moz-user-select: -moz-none;
+        -khtml-user-select: none;
+        -webkit-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+    }
+    *::-webkit-scrollbar {
+        width: 0.5em;
+        height: 0.5em;
+    }
+    *::-webkit-scrollbar-track {
+        
+    }
+    *::-webkit-scrollbar-corner { 
+        background-color: transparent;
+    }
+    *::-webkit-scrollbar-thumb {
+        background-color: rgb(255 255 255 / 25%);
+    }
     #app{
         display: flex;
         flex-direction: row;
         flex-wrap: wrap;
         align-content: flex-start;
         height: 100%;
+    }
+    #header{
+        width: 100%;
+        display: flex;
+        background: #1b1b1bf0;
+    }
+    #buttons{
+        display: flex;
+        background: transparent;
+        width:100%;
+        height:40px;
+    }
+    .button{
+        padding: 10px 15px;
+        color: #9b9b9b;
+        cursor: pointer;
+        font-size: 14px;
+        background: rgb(255 255 255 / 10%);
+        margin-right: 1px;
+        font-family: arial;
+        margin: 5px;
+        line-height: 10px;
+        min-width: 80px;
+        text-align: center;
+    }
+    .button.cmd{
+        padding: 5px 10px;
+        min-width: 50px;
+    }
+    .button:hover{
+        color:white;
+    }
+    #connect{
+        color:red;
+        min-width: 100px;
+    }
+    #connect.connected{
+        color:green;
+    }
+    #chipId{
+        background: transparent;
+        line-height: 40px;
+        margin-right: 10px;
+        color: white;
     }
     #code{
         float:left;
@@ -333,15 +529,34 @@ print(node.heap())
         outline: none;
         white-space: nowrap;
     }
-    #console{
+    .CodeMirror{
+        height: calc(100% - 80px);
+        flex: 1 0 50%;
+    }
+    .CodeMirror-scrollbar-filler {
+        display: none!important;
+    }
+    #consoleContainer{
         float:right;
         height: calc(100% - 80px);
         flex: 1 0 50%;
+        background:rgb(50,50,50);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    #consoleButtons{
+        display: flex;
+        background: #00000021;
+    }
+    #console{
         overflow: scroll;
         color:white;
         font-family: monospace;
         background:rgb(50,50,50);
-        padding:5px;
+        padding:0px 5px;
+        overflow: auto;
+        flex-grow: 1;
     }
     #debug{
         color: inherit;
@@ -354,7 +569,7 @@ print(node.heap())
     #commandTag{
         font-family: inherit;
         background: transparent;
-        color: inherit;
+        color: deepskyblue;
         font-size: inherit;
         font-family: inherit;
     }
@@ -374,6 +589,13 @@ print(node.heap())
         width:100%;
         height:40px;
     }
+    #deviceFiles{
+        display: flex;
+        padding-right: 10px;
+    }
+    #localFiles{
+        display: flex;
+    }
     .file{
         padding: 10px 15px;
         color: #9b9b9b;
@@ -390,29 +612,23 @@ print(node.heap())
         color:white;
     }
     .file.selected{
-        background: rgb(0 0 0 / 25%);
-        color:white;
-    }
-    #buttons{
-        display: flex;
-        background: #1b1b1b;
-        width:100%;
-        height:40px;
-    }
-    .button{
-        padding: 10px 15px;
-        color: #9b9b9b;
-        cursor: pointer;
-        font-size: 14px;
-        background: rgb(255 255 255 / 10%);
-        margin-right: 1px;
-        font-family: arial;
-        margin: 5px;
-        line-height: 10px;
-        min-width: 80px;
-        text-align: center;
-    }
-    .button:hover{
+        background: rgb(33 33 33);
         color:white;
     }
 </style>
+
+<!-- INITIALIZE CODEMIRROR -->
+<script>
+	editors = {}
+	var editor = CodeMirror.fromTextArea(document.getElementById("code"), {
+		lineNumbers: true,
+        theme: 'material-darker',
+		mode: 'javascript',
+	})
+    editor.on('change', editor => {
+        updateFile()
+    })
+    //this.editor.setOption("mode", "htmlmixed");
+    this.editor.setOption("mode", "lua");
+    refreshFilesBar()
+</script>
